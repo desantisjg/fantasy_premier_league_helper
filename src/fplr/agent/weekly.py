@@ -21,30 +21,26 @@ the conversation and restarts the runner on a pause, which is the documented rem
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-import anthropic
-
 from ..config import REPORTS_DIR
 from ..ingest import latest_snapshot, next_gameweek
+from .runner import (
+    MODEL,
+    WEB_SEARCH_TOOL,
+    AgentError,
+    build_client,
+    describe_api_error,
+    stream_agent,
+)
 from .tools import AGENT_TOOLS
 
-MODEL = "claude-opus-5"
-MAX_TOKENS = 16_000
-MAX_PAUSE_RESTARTS = 5
+#: Kept as an alias so callers that predate the shared runner still work.
+BriefError = AgentError
 
-#: Bounded so a single run cannot spend unboundedly on search.
-WEB_SEARCH_TOOL = {
-    "type": "web_search_20260209",
-    "name": "web_search",
-    "max_uses": 8,
-}
-
-SYSTEM_PROMPT = """\
-You are an analytical Fantasy Premier League assistant. You advise on one gameweek \
+SYSTEM_PROMPT = """You are an analytical Fantasy Premier League assistant. You advise on one gameweek \
 at a time, grounded in a fitted statistical model, and you show your reasoning in \
 terms of that model's numbers.
 
@@ -96,45 +92,7 @@ Lead with the recommendation. Every claim cites a number from a tool and, where 
 matters, the uncertainty around it. Use `explain_player` when a projection needs \
 justifying — a component breakdown is far more persuasive than a total. Be concise \
 and specific. Say plainly when the model is close to indifferent between options, \
-rather than manufacturing a distinction.\
-"""
-
-
-class BriefError(RuntimeError):
-    """A run that failed for a reason the user can act on."""
-
-
-def describe_api_error(error: Exception) -> str:
-    """Turn an SDK exception into something actionable.
-
-    Handled most-specific first: the distinction between "no credit", "bad key" and
-    "rate limited" is the whole point, and collapsing them into one message would
-    send someone to check the wrong thing.
-    """
-    if isinstance(error, anthropic.AuthenticationError):
-        return (
-            "Anthropic rejected the credentials. Check ANTHROPIC_API_KEY in .env, "
-            "or run `ant auth login`."
-        )
-    if isinstance(error, anthropic.PermissionDeniedError):
-        return "This key is not permitted to use the Messages API or this model."
-    if isinstance(error, anthropic.RateLimitError):
-        return "Rate limited by Anthropic. Wait for the retry-after window and rerun."
-    if isinstance(error, anthropic.BadRequestError):
-        message = str(getattr(error, "message", "") or error)
-        if "credit balance" in message.lower():
-            return (
-                "The Anthropic account has no credits, so the request was refused "
-                "before any work was done — nothing was charged. Add credits under "
-                "Plans & Billing at console.anthropic.com, then rerun `fpl brief`. "
-                "The key itself authenticated correctly."
-            )
-        return f"Anthropic rejected the request: {message}"
-    if isinstance(error, anthropic.APIConnectionError):
-        return f"Could not reach the Anthropic API: {error}"
-    if isinstance(error, anthropic.APIStatusError):
-        return f"Anthropic returned {error.status_code}: {error}"
-    return str(error)
+rather than manufacturing a distinction."""
 
 
 @dataclass
@@ -146,16 +104,8 @@ class BriefResult:
     usage: dict
 
 
-def _client() -> anthropic.Anthropic:
-    if not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")):
-        raise RuntimeError(
-            "No Anthropic credentials found. Set ANTHROPIC_API_KEY, or run "
-            "`ant auth login` to store a profile the SDK picks up automatically."
-        )
-    return anthropic.Anthropic()
-
-
-def _gameweek_context() -> tuple[int, str]:
+def gameweek_context() -> tuple[int, str]:
+    """The gameweek we are about to pick a team for, and its deadline."""
     snapshot = latest_snapshot()
     if snapshot is None:
         raise FileNotFoundError("no snapshot on disk; run `fpl sync` first")
@@ -165,18 +115,9 @@ def _gameweek_context() -> tuple[int, str]:
     return int(upcoming["id"]), upcoming["deadline_time"]
 
 
-def run_brief(
-    *,
-    question: str | None = None,
-    write: bool = True,
-    reports_dir: Path = REPORTS_DIR,
-    verbose: bool = True,
-) -> BriefResult:
-    """Produce the pre-deadline brief for the upcoming gameweek."""
-    client = _client()
-    gameweek, deadline = _gameweek_context()
-
-    task = question or (
+def brief_task(gameweek: int, deadline: str) -> str:
+    """The standard weekly request."""
+    return (
         f"Write my pre-deadline brief for gameweek {gameweek} (deadline {deadline}).\n\n"
         "Cover, in this order:\n"
         "1. Captain and vice-captain, argued from haul probability.\n"
@@ -190,75 +131,40 @@ def run_brief(
         "conclude. Keep it under 600 words."
     )
 
+
+def run_brief(
+    *,
+    question: str | None = None,
+    write: bool = True,
+    reports_dir: Path = REPORTS_DIR,
+    verbose: bool = True,
+) -> BriefResult:
+    """Produce the pre-deadline brief for the upcoming gameweek."""
+    client = build_client()
+    gameweek, deadline = gameweek_context()
+    task = question or brief_task(gameweek, deadline)
+
     # The stable prefix is cached; only the task text below it changes week to week.
     system = [
-        {
-            "type": "text",
-            "text": SYSTEM_PROMPT,
-            "cache_control": {"type": "ephemeral"},
-        }
+        {"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}
     ]
     messages: list[dict] = [{"role": "user", "content": task}]
-    tools = list(AGENT_TOOLS) + [WEB_SEARCH_TOOL]
 
-    usage = {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0}
-    final = None
-    restarts = 0
-
-    while True:
-        try:
-            runner = client.beta.messages.tool_runner(
-                model=MODEL,
-                max_tokens=MAX_TOKENS,
-                system=system,
-                tools=tools,
-                messages=messages,
-                thinking={"type": "adaptive"},
-                output_config={"effort": "high"},
-            )
-
-            last = None
-            for message in runner:
-                last = message
-                for key in usage:
-                    usage[key] += getattr(message.usage, key, 0) or 0
-                if verbose:
-                    # Server-side tools (web search) arrive as `server_tool_use`
-                    # blocks, not `tool_use`, so matching only the latter hides
-                    # them and makes it look like no search happened.
-                    called = [
-                        b.name
-                        for b in message.content
-                        if b.type in ("tool_use", "server_tool_use")
-                    ]
-                    if called:
-                        print(f"  → {', '.join(called)}", flush=True)
-
-                # Mirror the history: the runner keeps its own copy and does not
-                # expose it, so a restart after a pause needs our own record.
-                messages.append({"role": "assistant", "content": message.content})
-                tool_response = runner.generate_tool_call_response()
-                if tool_response is not None:
-                    messages.append(tool_response)
-        except anthropic.APIError as error:
-            raise BriefError(describe_api_error(error)) from error
-
-        final = last
-        if final is None or final.stop_reason != "pause_turn":
-            break
-
-        restarts += 1
-        if restarts > MAX_PAUSE_RESTARTS:
-            raise BriefError(
-                f"The turn was still paused after {MAX_PAUSE_RESTARTS} restarts. "
-                "This usually means web search is looping; rerun or lower max_uses."
-            )
-        if verbose:
-            print(f"  (paused mid-turn, resuming — restart {restarts})", flush=True)
-
-    text = "\n".join(
-        block.text for block in (final.content if final else []) if block.type == "text"
-    ).strip()
+    text, usage = "", {}
+    for event in stream_agent(
+        messages=messages,
+        system=system,
+        tools=list(AGENT_TOOLS) + [WEB_SEARCH_TOOL],
+        client=client,
+    ):
+        if event["type"] == "tools" and verbose:
+            print(f"  → {', '.join(event['names'])}", flush=True)
+        elif event["type"] == "paused" and verbose:
+            print(f"  (paused mid-turn, resuming — restart {event['restart']})", flush=True)
+        elif event["type"] == "text":
+            text = event["text"]
+        elif event["type"] == "done":
+            usage = event["usage"]
 
     path = None
     if write and text:

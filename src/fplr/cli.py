@@ -252,5 +252,30 @@ def brief_command(
     )
 
 
+@app.command("serve")
+def serve_command(
+    port: int = typer.Option(8000, help="Port to listen on."),
+    host: str = typer.Option("127.0.0.1", help="Interface to bind. Localhost by default."),
+    open_browser: bool = typer.Option(True, "--open/--no-open", help="Open a browser window."),
+) -> None:
+    """Start the local chat UI.
+
+    Binds to localhost only. The Anthropic key stays server-side and is never sent
+    to the browser, which is why this is a small server rather than a bare HTML
+    file — a page calling the API directly would have to ship the key to the client.
+    """
+    import threading
+    import webbrowser
+
+    from .web.server import serve
+
+    url = f"http://{host}:{port}"
+    typer.echo(f"FPL Assistant → {url}")
+    typer.echo("  Ctrl+C to stop")
+    if open_browser:
+        threading.Timer(1.2, lambda: webbrowser.open(url)).start()
+    serve(host=host, port=port)
+
+
 if __name__ == "__main__":
     app()

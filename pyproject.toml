@@ -12,10 +12,12 @@ dependencies = [
     "statsmodels>=0.14",
     "matplotlib>=3.8",
     "anthropic>=0.40",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "httpx>=0.27"]
 
 [project.scripts]
 fpl = "fplr.cli:app"

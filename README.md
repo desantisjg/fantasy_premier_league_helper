@@ -133,6 +133,26 @@ cp .env.example .env          # ANTHROPIC_API_KEY, FPL_ENTRY_ID
 Find `FPL_ENTRY_ID` by logging in, opening the **Points** tab, and reading the number
 in the URL: `fantasy.premierleague.com/entry/<ID>/event/<GW>`.
 
+### The local chat UI
+
+```bash
+.venv/bin/fpl serve      # http://127.0.0.1:8000, opens automatically
+```
+
+A dark-mode chat app that opens with *"Hi Jordan, here is the latest gameweek
+report…"* and the current brief, then lets you interrogate it — "why him?", "what
+about a cheaper defender?", "how confident are you?". The assistant answers with the
+same tools the brief uses, so follow-ups are grounded in the model rather than in
+what it just said.
+
+Tool activity streams live as it works (`ranking players`, `checking haul odds`,
+`searching the news`), because a full agent turn can take a minute and a bare spinner
+is indistinguishable from a hang.
+
+It is a small server rather than a standalone HTML file for one reason: **the
+Anthropic key stays server-side**. A page calling the API directly would have to ship
+the key to the browser, where anyone can read it. Binds to localhost only.
+
 ### Commands
 
 | Command | Does |
@@ -143,6 +163,7 @@ in the URL: `fantasy.premierleague.com/entry/<ID>/event/<GW>`.
 | `fpl score` | Rank players. `--position`, `--max-price`, `--top`, `--output json`. |
 | `fpl haul` | Rank by P(10+ points) — the captaincy question. |
 | `fpl brief` | Agent run → `reports/gwNN_brief.md`. |
+| `fpl serve` | Local dark-mode chat UI on `127.0.0.1:8000`. |
 
 ---
 
@@ -303,14 +324,15 @@ src/fplr/
   report.py     inferential + predictive ML report
   train.py      versioning and the promotion gate
   score.py      score upcoming fixtures
-  agent/        tools and the weekly advisory loop
+  agent/        runner (shared loop), tools, weekly brief
+  web/          FastAPI server + the chat UI
 .claude/skills/fpl/   Claude Code skill
 ```
 
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest -q     # 68 passed
+.venv/bin/python -m pytest -q     # 74 passed
 ```
 
 | File | Covers |
@@ -320,6 +342,7 @@ src/fplr/
 | `test_features.py` | Leakage, horizon freezing, walk-forward ordering |
 | `test_model.py` | Component arithmetic, calibration, evaluation harness |
 | `test_agent.py` | Tool contracts, ambiguity handling, baseline visibility |
+| `test_web.py` | UI server endpoints, brief ordering, credential failure path |
 
 ---
 
